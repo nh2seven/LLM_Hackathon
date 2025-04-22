@@ -12,3 +12,5 @@ numpy
 scikit-learn
 requests
 argparse
+markdown
+PyMuPDF
