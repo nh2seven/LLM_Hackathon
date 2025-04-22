@@ -8,3 +8,7 @@ setuptools-rust
 pytesseract
 reportlab
 pillow
+numpy
+scikit-learn
+requests
+argparse
