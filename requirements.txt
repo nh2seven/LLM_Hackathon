@@ -1,6 +1,10 @@
 markdown-pdf
 pdfplumber
+transformers
 sentence_transformers
 openai-whisper
 faster-whisper
 setuptools-rust
+pytesseract
+reportlab
+pillow
