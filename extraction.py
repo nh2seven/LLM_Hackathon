@@ -1,4 +1,3 @@
-import os
 import hashlib
 import fitz  # PyMuPDF
 from PIL import Image
@@ -6,21 +5,23 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.units import cm
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
+from transformers import pipeline
 import torch
 from pathlib import Path
+import csv
 
-# Lazy loading for BLIP-2 model
-_blip2_model = None
-_blip2_processor = None
+# Check for GPU availability
+device = 0 if torch.cuda.is_available() else -1
+print(f"Using device: {'GPU' if device == 0 else 'CPU'}")
 
+# Lazy loading for DistilBART model
+_summarizer = None
 
-def get_blip2():
-    global _blip2_model, _blip2_processor
-    if _blip2_model is None or _blip2_processor is None:
-        _blip2_processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b", use_fast=True)
-        _blip2_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b").eval()
-    return _blip2_model, _blip2_processor
+def get_summarizer():
+    global _summarizer
+    if _summarizer is None:
+        _summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device=device)
+    return _summarizer
 
 
 def hash_image_bytes(image_bytes):
@@ -75,27 +76,37 @@ def extract_pdf_content_filtered(pdf_path):
     return all_slides
 
 
-def generate_contextual_description(image_path, slide_text):
-    question = (
-        "Based on the context of the slide, explain what this image is showing. "
-        "Focus on describing any diagrams, tables, or flowcharts in relation to the slide content."
-    )
-    prompt = f"{slide_text}\n\n{question}"
-    image = Image.open(image_path).convert('RGB')
-    model, processor = get_blip2()
-    inputs = processor(images=image, text=prompt, return_tensors="pt")
-    out = model.generate(**inputs, max_new_tokens=100)
-    return processor.decode(out[0], skip_special_tokens=True)
+def generate_caption_with_distilbart(slide_text):
+    """Generate a caption using DistilBART summarization model"""
+    if not slide_text.strip():
+        return "No description available"
+        
+    summarizer = get_summarizer()
+    try:
+        summary = summarizer(slide_text, max_length=25, min_length=10, do_sample=False)[0]['summary_text']
+        return summary
+    except Exception as e:
+        print(f"Error generating caption: {e}")
+        return "Caption generation failed"
 
 
-def generate_notes(slides, output_path="converted_notes.txt"):
+def get_caption_from_descriptions(image_path, image_descriptions):
+    """Get caption for an image from the image descriptions list"""
+    for path, caption in image_descriptions:
+        if path == image_path:
+            return caption
+    return "No description available"
+
+
+def generate_notes(slides, image_descriptions, output_path="converted_notes_gen.txt"):
+    """Generate text notes using captions from the CSV"""
     notes = ""
     for slide in slides:
         notes += f"\n---\n## Slide {slide['slide_number']}: {slide['title']}\n\n"
         notes += f"**Content:**\n{slide['content']}\n\n"
 
         for img_path in slide['images']:
-            caption = generate_contextual_description(img_path, slide['content'][:500])
+            caption = get_caption_from_descriptions(img_path, image_descriptions)
             notes += f"**Image:** {img_path}\nCaption: {caption}\n\n"
 
     with open(output_path, "w") as f:
@@ -104,7 +115,8 @@ def generate_notes(slides, output_path="converted_notes.txt"):
     return output_path
 
 
-def generate_pdf_notes(slides, output_path="quick_notes.pdf"):
+def generate_pdf_notes(slides, image_descriptions, output_path="quick_notes_gen.pdf"):
+    """Generate PDF notes using captions from the CSV"""
     c = canvas.Canvas(str(output_path), pagesize=A4)
     width, height = A4
     margin = 2 * cm
@@ -140,7 +152,7 @@ def generate_pdf_notes(slides, output_path="quick_notes.pdf"):
                 c.drawImage(ImageReader(img), margin, y_pos - img_height, width=img_width, height=img_height)
                 y_pos -= img_height + 0.5 * cm
 
-                caption = generate_contextual_description(img_path, slide['content'][:500])
+                caption = get_caption_from_descriptions(img_path, image_descriptions)
                 c.setFont("Helvetica-Oblique", 10)
                 c.drawString(margin, y_pos, f"Caption: {caption}")
                 y_pos -= 1.2 * cm
@@ -155,16 +167,66 @@ def generate_pdf_notes(slides, output_path="quick_notes.pdf"):
     return output_path
 
 
+def generate_image_descriptions_csv(slides, output_csv_path):
+    """Generate CSV with image descriptions using DistilBART"""
+    image_descriptions = []
+    
+    for slide in slides:
+        slide_text = slide['content'][:500]  # Use first 500 chars of slide content for context
+        
+        for img_path in slide['images']:
+            if '_0.' in img_path:  # Skip _0 images as in original captioning.py
+                continue
+                
+            caption = generate_caption_with_distilbart(slide_text)
+            image_descriptions.append((img_path, caption))
+    
+    # Save as CSV
+    with open(output_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Image Name', 'Description'])
+        writer.writerows(image_descriptions)
+    
+    print(f"✅ CSV saved as {output_csv_path}")
+    return image_descriptions
+
+
 def process_pdf(pdf_path, output_text=None, output_pdf=None):
+    """Process a single PDF file to extract content and generate notes"""
     print(f"Processing: {pdf_path}")
     slides = extract_pdf_content_filtered(pdf_path)
-    if output_text:
-        generate_notes(slides, output_path=output_text)
-    if output_pdf:
-        generate_pdf_notes(slides, output_path=output_pdf)
+    
+    # Generate base filename for outputs
+    pdf_path_obj = Path(pdf_path)
+    base_name = pdf_path_obj.stem
+    output_dir = pdf_path_obj.parent
+    
+    # Generate CSV with image captions
+    csv_path = output_dir / f"{base_name}_captions.csv"
+    image_descriptions = generate_image_descriptions_csv(slides, csv_path)
+    
+    # Set default output paths if not specified
+    if output_text is None:
+        output_text = output_dir / f"{base_name}_gen.txt"
+    elif output_text == "converted_notes.txt":  # Default value from argparse
+        output_text = output_dir / f"{base_name}_gen.txt"
+        
+    if output_pdf is None:
+        output_pdf = output_dir / f"{base_name}_gen.pdf"
+    elif output_pdf == "quick_notes.pdf":  # Default value from argparse
+        output_pdf = output_dir / f"{base_name}_gen.pdf"
+    
+    # Generate text notes
+    generate_notes(slides, image_descriptions, output_path=output_text)
+    
+    # Generate PDF
+    generate_pdf_notes(slides, image_descriptions, output_path=output_pdf)
+    
+    return slides, image_descriptions
 
 
 def batch_extract_pdfs(dataset_dir="LLM_DATASET"):
+    """Process all PDF files in the dataset directory with the new naming scheme"""
     dataset_path = Path(dataset_dir)
     pdf_files = list(dataset_path.rglob("*.pdf"))
 
@@ -173,18 +235,23 @@ def batch_extract_pdfs(dataset_dir="LLM_DATASET"):
         return
 
     for pdf_file in pdf_files:
-        output_txt = pdf_file.with_suffix(".txt")
-        output_pdf = pdf_file.with_name(pdf_file.stem + "_cleaned.pdf")
+        # Skip files that have already been processed (contain "_cleaned" or "_gen" in the name)
+        if "_cleaned" in pdf_file.stem or "_gen" in pdf_file.stem:
+            continue
+            
+        base_name = pdf_file.stem
+        output_txt = pdf_file.parent / f"{base_name}_gen.txt"
+        output_pdf = pdf_file.parent / f"{base_name}_gen.pdf"
         process_pdf(pdf_file, output_text=output_txt, output_pdf=output_pdf)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Extract notes from PDF slides with contextual image captions.")
+    parser = argparse.ArgumentParser(description="Extract notes from PDF slides with DistilBART image captions.")
     parser.add_argument("pdf_path", nargs="?", help="Path to the PDF file")
-    parser.add_argument("--output-text", default="converted_notes.txt", help="Text output file")
-    parser.add_argument("--output-pdf", default="quick_notes.pdf", help="PDF output file")
+    parser.add_argument("--output-text", help="Text output file (defaults to <filename>_gen.txt)")
+    parser.add_argument("--output-pdf", help="PDF output file (defaults to <filename>_gen.pdf)")
     parser.add_argument("--batch", action="store_true", help="Run in batch mode on all PDFs in dataset directory")
     parser.add_argument("--dataset-dir", default="LLM_DATASET", help="Directory containing PDFs (used in batch mode)")
     args = parser.parse_args()
